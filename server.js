@@ -23,7 +23,6 @@ mongoose
   .then(() => console.log("Connected to MongoDB Atlas"))
   .catch((err) => console.error("MongoDB connection failed:", err.message));
 
-// Document Schema
 const DocumentSchema = new mongoose.Schema({
   _id: String,
   data: Object,
@@ -31,72 +30,95 @@ const DocumentSchema = new mongoose.Schema({
 const Document = mongoose.model("Document", DocumentSchema);
 
 async function findOrCreateDocument(id) {
-  if (!id) return;
-  const doc = await Document.findById(id);
-  if (doc) return doc;
-  return await Document.create({ _id: id, data: "" });
+  if (!id) return null;
+  try {
+    const doc = await Document.findById(id);
+    if (doc) return doc;
+    return await Document.create({ _id: id, data: "" });
+  } catch (err) {
+    console.error("Document lookup error:", err.message);
+    return null;
+  }
 }
 
 // In-Memory Room States: docId -> { isLocked: boolean, hostKey: string }
 const roomStates = new Map();
 
-// Rate-limiting and size thresholds
-const socketRateLimits = new Map();
-const MAX_PAYLOAD_SIZE = 1 * 1024 * 1024; // 1 MB limit
-const MAX_MESSAGES_PER_SEC = 30;
-
-function isRateLimited(socketId) {
-  const now = Date.now();
-  const record = socketRateLimits.get(socketId) || { count: 0, lastReset: now };
-
-  if (now - record.lastReset > 1000) {
-    record.count = 1;
-    record.lastReset = now;
-  } else {
-    record.count += 1;
-  }
-
-  socketRateLimits.set(socketId, record);
-  return record.count > MAX_MESSAGES_PER_SEC;
-}
-
 io.on("connection", (socket) => {
-  socket.on("get-document", async ({ docId, hostKey }) => {
+  console.log("Client connected:", socket.id);
+
+  // Safe handler: supports both { docId, hostKey } AND plain string docId
+  socket.on("get-document", async (payload) => {
+    const docId = typeof payload === "object" && payload !== null ? payload.docId : payload;
+    const incomingHostKey = typeof payload === "object" && payload !== null ? payload.hostKey : null;
+
+    if (!docId) return;
+
     socket.join(docId);
     socket.currentRoom = docId;
 
     let room = roomStates.get(docId);
+
     if (!room) {
-      const assignedKey = hostKey || require("crypto").randomUUID();
+      // First person to open this room becomes Host
+      const assignedKey = incomingHostKey || require("crypto").randomUUID();
       room = { isLocked: false, hostKey: assignedKey };
       roomStates.set(docId, room);
       socket.isHost = true;
       socket.hostKey = assignedKey;
     } else {
-      const isHost = Boolean(hostKey && room.hostKey === hostKey);
-      socket.isHost = isHost;
-      socket.hostKey = hostKey;
+      // Joining socket is host ONLY if their hostKey matches the existing room's hostKey
+      const isMatch = Boolean(incomingHostKey && room.hostKey === incomingHostKey);
+      socket.isHost = isMatch;
+      socket.hostKey = isMatch ? incomingHostKey : null;
     }
 
     const document = await findOrCreateDocument(docId);
-    socket.emit("load-document", document.data);
+    socket.emit("load-document", document ? document.data : "");
 
+    // Send host role and lock state
     socket.emit("room-init", {
       isHost: socket.isHost,
       isLocked: room.isLocked,
       assignedHostKey: socket.isHost ? room.hostKey : null,
     });
 
+    // Notify all devices in this room of the updated participant count
     const count = io.sockets.adapter.rooms.get(docId)?.size || 1;
     io.to(docId).emit("user-count", count);
   });
 
-  socket.on("toggle-lock", ({ docId, hostKey }) => {
+  socket.on("toggle-lock", (payload) => {
+    const docId = typeof payload === "object" ? payload.docId : socket.currentRoom;
+    const hostKey = typeof payload === "object" ? payload.hostKey : socket.hostKey;
+
     const room = roomStates.get(docId);
     if (!room || room.hostKey !== hostKey) return;
 
     room.isLocked = !room.isLocked;
     io.to(docId).emit("lock-updated", room.isLocked);
+  });
+
+  socket.on("send-changes", (incomingData) => {
+    if (!socket.currentRoom || typeof incomingData !== "string") return;
+
+    const room = roomStates.get(socket.currentRoom);
+    if (room?.isLocked && !socket.isHost) return; // Block changes if room is locked and user is not host
+
+    socket.broadcast.to(socket.currentRoom).emit("receive-changes", incomingData);
+  });
+
+  socket.on("save-document", async (documentData) => {
+    if (!socket.currentRoom || typeof documentData !== "string") return;
+
+    const room = roomStates.get(socket.currentRoom);
+    if (room?.isLocked && !socket.isHost) return;
+
+    try {
+      await Document.findByIdAndUpdate(socket.currentRoom, { data: documentData });
+    } catch (err) {
+      console.error("Save error:", err.message);
+    }
   });
 
   socket.on("cursor-move", (data) => {
@@ -108,33 +130,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("send-changes", (incomingData) => {
-    if (typeof incomingData !== "string") return;
-    if (Buffer.byteLength(incomingData, "utf8") > MAX_PAYLOAD_SIZE) return;
-    if (isRateLimited(socket.id)) return;
-
-    const room = roomStates.get(socket.currentRoom);
-    if (room?.isLocked && !socket.isHost) return;
-
-    socket.broadcast.to(socket.currentRoom).emit("receive-changes", incomingData);
-  });
-
-  socket.on("save-document", async (documentData) => {
-    if (typeof documentData !== "string") return;
-    if (Buffer.byteLength(documentData, "utf8") > MAX_PAYLOAD_SIZE) return;
-
-    const room = roomStates.get(socket.currentRoom);
-    if (room?.isLocked && !socket.isHost) return;
-
-    try {
-      await Document.findByIdAndUpdate(socket.currentRoom, { data: documentData });
-    } catch (err) {
-      console.error("Save failed:", err.message);
-    }
-  });
-
   socket.on("disconnect", () => {
-    socketRateLimits.delete(socket.id);
     if (socket.currentRoom) {
       socket.broadcast.to(socket.currentRoom).emit("cursor-remove", socket.id);
       const count = io.sockets.adapter.rooms.get(socket.currentRoom)?.size || 0;
@@ -145,5 +141,5 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`SyncScript server listening on port ${PORT}`);
+  console.log(`SyncScript server active on port ${PORT}`);
 });
