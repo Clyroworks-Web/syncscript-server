@@ -102,3 +102,58 @@ const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
+
+// Rate limiting tracker: socketId -> { count, lastReset }
+const socketRateLimits = new Map();
+const MAX_PAYLOAD_SIZE = 1 * 1024 * 1024; // 1 MB limit
+const MAX_MESSAGES_PER_SEC = 30;
+
+function isRateLimited(socketId) {
+  const now = Date.now();
+  const record = socketRateLimits.get(socketId) || { count: 0, lastReset: now };
+
+  if (now - record.lastReset > 1000) {
+    record.count = 1;
+    record.lastReset = now;
+  } else {
+    record.count += 1;
+  }
+
+  socketRateLimits.set(socketId, record);
+  return record.count > MAX_MESSAGES_PER_SEC;
+}
+
+io.on("connection", (socket) => {
+  // Clean up tracking on disconnect
+  socket.on("disconnect", () => {
+    socketRateLimits.delete(socket.id);
+  });
+
+  socket.on("send-changes", (incomingData) => {
+    // 1. Validate data type
+    if (typeof incomingData !== "string") return;
+
+    // 2. Enforce payload size limit
+    if (Buffer.byteLength(incomingData, "utf8") > MAX_PAYLOAD_SIZE) {
+      return socket.emit("error-message", "Payload exceeds 1MB limit.");
+    }
+
+    // 3. Enforce rate limiting
+    if (isRateLimited(socket.id)) {
+      return socket.emit("error-message", "Rate limit exceeded. Please slow down.");
+    }
+
+    socket.broadcast.to(socket.currentRoom).emit("receive-changes", incomingData);
+  });
+
+  socket.on("save-document", async (documentData) => {
+    if (typeof documentData !== "string") return;
+    if (Buffer.byteLength(documentData, "utf8") > MAX_PAYLOAD_SIZE) return;
+
+    try {
+      await Document.findByIdAndUpdate(socket.currentRoom, { data: documentData });
+    } catch (err) {
+      console.error("Database save failed:", err.message);
+    }
+  });
+});
