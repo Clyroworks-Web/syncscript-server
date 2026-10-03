@@ -9,11 +9,9 @@ require("dotenv").config();
 const app = express();
 app.use(cors());
 
-// Render dynamically provides PORT via environment variables
 const PORT = process.env.PORT || 5000;
 const server = http.createServer(app);
 
-// Configure Socket.io with open CORS
 const io = new Server(server, {
   cors: {
     origin: "*",
@@ -21,12 +19,10 @@ const io = new Server(server, {
   },
 });
 
-// Root Health Check (Prevents 502 Bad Gateway on Render)
 app.get("/", (req, res) => {
   res.send("SyncScript server is healthy and running!");
 });
 
-// MongoDB Connection
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/syncscript";
 
 mongoose
@@ -34,10 +30,10 @@ mongoose
   .then(() => console.log("Connected to MongoDB Atlas"))
   .catch((err) => console.error("MongoDB Connection Error:", err.message));
 
-// Document Schema
+// 1. Correct Schema: data is String (HTML), not Object
 const DocumentSchema = new mongoose.Schema({
   _id: String,
-  data: Object,
+  data: { type: String, default: "" },
 });
 
 const Document = mongoose.model("Document", DocumentSchema);
@@ -54,10 +50,9 @@ async function findOrCreateDocument(id) {
   }
 }
 
-// In-memory room manager: docId -> { isLocked: boolean, hostKey: string }
+// In-memory room manager: docId -> { isLocked: boolean, hostKey: string, data: string }
 const roomStates = new Map();
 
-// Socket handlers
 io.on("connection", (socket) => {
   socket.on("get-document", async (payload) => {
     const docId = typeof payload === "object" && payload !== null ? payload.docId : payload;
@@ -72,7 +67,14 @@ io.on("connection", (socket) => {
 
     if (!room) {
       const assignedKey = incomingHostKey || crypto.randomUUID();
-      room = { isLocked: false, hostKey: assignedKey };
+      const document = await findOrCreateDocument(docId);
+      const initialData = document ? document.data : "";
+
+      room = {
+        isLocked: false,
+        hostKey: assignedKey,
+        data: initialData,
+      };
       roomStates.set(docId, room);
       socket.isHost = true;
       socket.hostKey = assignedKey;
@@ -82,8 +84,8 @@ io.on("connection", (socket) => {
       socket.hostKey = isMatch ? incomingHostKey : null;
     }
 
-    const document = await findOrCreateDocument(docId);
-    socket.emit("load-document", document ? document.data : "");
+    // 2. Immediately send the active room buffer to late arrivals or refreshed tabs
+    socket.emit("load-document", room.data || "");
 
     socket.emit("room-init", {
       isHost: socket.isHost,
@@ -99,6 +101,11 @@ io.on("connection", (socket) => {
     if (!socket.currentRoom) return;
     const room = roomStates.get(socket.currentRoom);
     if (room?.isLocked && !socket.isHost) return;
+
+    // Keep active in-memory buffer synced on every keystroke
+    if (room && typeof delta === "string") {
+      room.data = delta;
+    }
 
     socket.broadcast.to(socket.currentRoom).emit("receive-changes", delta);
   });
@@ -127,8 +134,16 @@ io.on("connection", (socket) => {
     const room = roomStates.get(socket.currentRoom);
     if (room?.isLocked && !socket.isHost) return;
 
+    if (room && typeof data === "string") {
+      room.data = data;
+    }
+
     try {
-      await Document.findByIdAndUpdate(socket.currentRoom, { data });
+      await Document.findByIdAndUpdate(
+        socket.currentRoom,
+        { data: typeof data === "string" ? data : "" },
+        { upsert: true }
+      );
     } catch (err) {
       console.error("Save error:", err.message);
     }
@@ -143,7 +158,6 @@ io.on("connection", (socket) => {
   });
 });
 
-// Explicitly bind to "0.0.0.0" so Render proxy can route requests
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`SyncScript server active on port ${PORT}`);
 });
