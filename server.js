@@ -4,11 +4,12 @@ const { Server } = require("socket.io");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const crypto = require("crypto");
+require("dotenv").config();
 
 const app = express();
 app.use(cors());
 
-// Render provides the PORT dynamically via environment variables
+// Render dynamically provides PORT via environment variables
 const PORT = process.env.PORT || 5000;
 const server = http.createServer(app);
 
@@ -18,6 +19,11 @@ const io = new Server(server, {
     origin: "*",
     methods: ["GET", "POST"],
   },
+});
+
+// Root Health Check (Prevents 502 Bad Gateway on Render)
+app.get("/", (req, res) => {
+  res.send("SyncScript server is healthy and running!");
 });
 
 // MongoDB Connection
@@ -50,11 +56,6 @@ async function findOrCreateDocument(id) {
 
 // In-memory room manager: docId -> { isLocked: boolean, hostKey: string }
 const roomStates = new Map();
-
-// Root route for health check
-app.get("/", (req, res) => {
-  res.send("SyncScript server is healthy and running!");
-});
 
 // Socket handlers
 io.on("connection", (socket) => {
@@ -142,6 +143,7 @@ io.on("connection", (socket) => {
   });
 });
 
-server.listen(PORT, () => {
+// Explicitly bind to "0.0.0.0" so Render proxy can route requests
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`SyncScript server active on port ${PORT}`);
 });
