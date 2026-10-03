@@ -41,14 +41,16 @@ async function findOrCreateDocument(id) {
   }
 }
 
-// In-Memory Room States: docId -> { isLocked: boolean, hostKey: string }
+// 1. Initialize the in-memory store for active rooms
+// Maps: docId -> { isLocked: boolean, hostKey: string }
 const roomStates = new Map();
 
 io.on("connection", (socket) => {
   console.log("Client connected:", socket.id);
 
-  // Safe handler: supports both { docId, hostKey } AND plain string docId
+  // 2. Safe Room Joining & Host Resolution
   socket.on("get-document", async (payload) => {
+    // Accepts either { docId, hostKey } OR a plain string docId
     const docId = typeof payload === "object" && payload !== null ? payload.docId : payload;
     const incomingHostKey = typeof payload === "object" && payload !== null ? payload.hostKey : null;
 
@@ -60,14 +62,14 @@ io.on("connection", (socket) => {
     let room = roomStates.get(docId);
 
     if (!room) {
-      // First person to open this room becomes Host
+      // First person to open this room becomes the Host
       const assignedKey = incomingHostKey || require("crypto").randomUUID();
       room = { isLocked: false, hostKey: assignedKey };
       roomStates.set(docId, room);
       socket.isHost = true;
       socket.hostKey = assignedKey;
     } else {
-      // Joining socket is host ONLY if their hostKey matches the existing room's hostKey
+      // Other sockets are Hosts ONLY if their hostKey matches the room's hostKey
       const isMatch = Boolean(incomingHostKey && room.hostKey === incomingHostKey);
       socket.isHost = isMatch;
       socket.hostKey = isMatch ? incomingHostKey : null;
@@ -76,38 +78,42 @@ io.on("connection", (socket) => {
     const document = await findOrCreateDocument(docId);
     socket.emit("load-document", document ? document.data : "");
 
-    // Send host role and lock state
+    // Send the resolved role and lock state back to the client
     socket.emit("room-init", {
       isHost: socket.isHost,
       isLocked: room.isLocked,
       assignedHostKey: socket.isHost ? room.hostKey : null,
     });
 
-    // Notify all devices in this room of the updated participant count
+    // Notify all participants in this room of the updated user count
     const count = io.sockets.adapter.rooms.get(docId)?.size || 1;
     io.to(docId).emit("user-count", count);
   });
 
+  // 3. Host-Verified Presenter Lock Toggle
   socket.on("toggle-lock", (payload) => {
     const docId = typeof payload === "object" ? payload.docId : socket.currentRoom;
     const hostKey = typeof payload === "object" ? payload.hostKey : socket.hostKey;
 
     const room = roomStates.get(docId);
-    if (!room || room.hostKey !== hostKey) return;
+    if (!room || room.hostKey !== hostKey) return; // Ignore if not the host
 
     room.isLocked = !room.isLocked;
     io.to(docId).emit("lock-updated", room.isLocked);
   });
 
+  // 4. Read-Only Protection on Typing
   socket.on("send-changes", (incomingData) => {
     if (!socket.currentRoom || typeof incomingData !== "string") return;
 
     const room = roomStates.get(socket.currentRoom);
-    if (room?.isLocked && !socket.isHost) return; // Block changes if room is locked and user is not host
+    // Discard keystrokes if the room is locked and sender is not the host
+    if (room?.isLocked && !socket.isHost) return;
 
     socket.broadcast.to(socket.currentRoom).emit("receive-changes", incomingData);
   });
 
+  // 5. Read-Only Protection on Cloud Saving
   socket.on("save-document", async (documentData) => {
     if (!socket.currentRoom || typeof documentData !== "string") return;
 
