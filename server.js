@@ -3,21 +3,51 @@ const http = require("http");
 const { Server } = require("socket.io");
 const mongoose = require("mongoose");
 const cors = require("cors");
+
+const helmet = require("helmet");
 const crypto = require("crypto");
 require("dotenv").config();
 
 const app = express();
-app.use(cors());
+// 1. Resolve: X-Content-Type-Options, Anti-Clickjacking, HSTS, and X-Powered-By
+app.use(
+  helmet({
+    contentSecurityPolicy: false, // Managed separately so it doesn't break socket polling
+    crossOriginEmbedderPolicy: false,
+  })
+);
+
+// 2. Resolve: Cross-Domain Misconfiguration (Lock down CORS to your Vercel frontend)
+const allowedOrigins = [
+  "https://syncscript-client-sigma.vercel.app",
+  "http://localhost:5173",
+  "http://localhost:3000",
+  ...(process.env.CLIENT_URL ? [process.env.CLIENT_URL] : []),
+];
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (like mobile apps, curl, or server-to-server)
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error("CORS policy violation: Unauthorized origin"));
+    },
+    credentials: true,
+  })
+);
 
 // Render dynamically provides PORT via environment variables
 const PORT = process.env.PORT || 5000;
 const server = http.createServer(app);
 
-// Configure Socket.io with open CORS
+// 3. Secure Socket.io CORS
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: allowedOrigins,
     methods: ["GET", "POST"],
+    credentials: true,
   },
 });
 
