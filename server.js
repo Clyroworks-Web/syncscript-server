@@ -3,32 +3,30 @@ const http = require("http");
 const { Server } = require("socket.io");
 const mongoose = require("mongoose");
 const cors = require("cors");
-
 const helmet = require("helmet");
 const crypto = require("crypto");
 require("dotenv").config();
 
 const app = express();
-// 1. Resolve: X-Content-Type-Options, Anti-Clickjacking, HSTS, and X-Powered-By
+
+// Security Headers: blocks clickjacking, sniffing, and hides X-Powered-By
 app.use(
   helmet({
-    contentSecurityPolicy: false, // Managed separately so it doesn't break socket polling
+    contentSecurityPolicy: false,
     crossOriginEmbedderPolicy: false,
   })
 );
 
-// 2. Resolve: Cross-Domain Misconfiguration (Lock down CORS to your Vercel frontend)
+// Restricted CORS: only allows authorized local and production origins
 const allowedOrigins = [
   "https://syncscript-client-sigma.vercel.app",
   "http://localhost:5173",
   "http://localhost:3000",
-  ...(process.env.CLIENT_URL ? [process.env.CLIENT_URL] : []),
 ];
 
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (like mobile apps, curl, or server-to-server)
       if (!origin || allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
@@ -38,11 +36,10 @@ app.use(
   })
 );
 
-// Render dynamically provides PORT via environment variables
 const PORT = process.env.PORT || 5000;
 const server = http.createServer(app);
 
-// 3. Secure Socket.io CORS
+// Socket.io configuration matching Express CORS policy
 const io = new Server(server, {
   cors: {
     origin: allowedOrigins,
@@ -51,12 +48,12 @@ const io = new Server(server, {
   },
 });
 
-// Root Health Check Route (prevents 502 Bad Gateway)
+// Root Health Check Route
 app.get("/", (req, res) => {
   res.send("SyncScript server is healthy and running!");
 });
 
-// MongoDB Connection
+// MongoDB Atlas Connection
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/syncscript";
 
 mongoose
@@ -64,10 +61,15 @@ mongoose
   .then(() => console.log("Connected to MongoDB Atlas"))
   .catch((err) => console.error("MongoDB Connection Error:", err.message));
 
-// Document Schema (Stores sanitized HTML string)
+// Document Schema with 30-Day Auto-Expiration (TTL)
 const DocumentSchema = new mongoose.Schema({
   _id: String,
   data: { type: String, default: "" },
+  updatedAt: {
+    type: Date,
+    default: Date.now,
+    expires: 2592000, // 30 days in seconds (30 * 24 * 60 * 60)
+  },
 });
 
 const Document = mongoose.model("Document", DocumentSchema);
@@ -122,7 +124,7 @@ io.on("connection", (socket) => {
       socket.hostKey = isMatch ? incomingHostKey : null;
     }
 
-    // Immediately send the active room buffer to late arrivals or refreshed tabs
+    // Immediately send current buffer to late arrivals or refreshed clients
     socket.emit("load-document", room.data || "");
 
     socket.emit("room-init", {
@@ -140,7 +142,6 @@ io.on("connection", (socket) => {
     const room = roomStates.get(socket.currentRoom);
     if (room?.isLocked && !socket.isHost) return;
 
-    // Keep active in-memory buffer synced on every keystroke
     if (room && typeof delta === "string") {
       room.data = delta;
     }
@@ -167,26 +168,25 @@ io.on("connection", (socket) => {
     io.to(docId).emit("lock-updated", room.isLocked);
   });
 
-  // Trailing-Edge Save: Updates RAM immediately, flushes to MongoDB after 1000ms idle
+  // Trailing-Edge Save: Updates RAM immediately, persists to MongoDB after 1000ms idle
   socket.on("save-document", (data) => {
     if (!socket.currentRoom) return;
     const docId = socket.currentRoom;
     const room = roomStates.get(docId);
 
-    // Prevent non-hosts from saving when the room is locked
     if (room?.isLocked && !socket.isHost) return;
 
-    // 1. Instant in-memory update (Zero delay for active users & reconnects)
+    // 1. Instant in-memory cache update
     if (room && typeof data === "string") {
       room.data = data;
     }
 
-    // 2. Clear existing pending timer if new keystrokes arrive
+    // 2. Reset debounce timer on ongoing activity
     if (saveTimeouts.has(docId)) {
       clearTimeout(saveTimeouts.get(docId));
     }
 
-    // 3. Schedule the single database write 1000ms after the last stroke
+    // 3. Flush to MongoDB and refresh the 30-day TTL timestamp
     const timeoutId = setTimeout(async () => {
       saveTimeouts.delete(docId);
       const activeRoom = roomStates.get(docId);
@@ -195,7 +195,7 @@ io.on("connection", (socket) => {
       try {
         await Document.findByIdAndUpdate(
           docId,
-          { data: activeRoom.data },
+          { data: activeRoom.data, updatedAt: new Date() },
           { upsert: true }
         );
       } catch (err) {
@@ -206,7 +206,7 @@ io.on("connection", (socket) => {
     saveTimeouts.set(docId, timeoutId);
   });
 
-  // Disconnection handler with last-occupant flush and memory cleanup
+  // Disconnection handling: last-occupant flush and RAM cleanup
   socket.on("disconnect", async () => {
     const docId = socket.currentRoom;
     if (!docId) return;
@@ -215,32 +215,32 @@ io.on("connection", (socket) => {
     const roomOccupants = io.sockets.adapter.rooms.get(docId)?.size || 0;
     io.to(docId).emit("user-count", roomOccupants);
 
-    // If the room is now empty, immediately write any pending buffer to MongoDB
     if (roomOccupants === 0) {
       if (saveTimeouts.has(docId)) {
         clearTimeout(saveTimeouts.get(docId));
         saveTimeouts.delete(docId);
+      }
 
-        const room = roomStates.get(docId);
-        if (room?.data) {
-          try {
-            await Document.findByIdAndUpdate(
-              docId,
-              { data: room.data },
-              { upsert: true }
-            );
-          } catch (err) {
-            console.error("Final exit save error:", err.message);
-          }
+      const room = roomStates.get(docId);
+      if (room?.data) {
+        try {
+          await Document.findByIdAndUpdate(
+            docId,
+            { data: room.data, updatedAt: new Date() },
+            { upsert: true }
+          );
+        } catch (err) {
+          console.error("Final exit save error:", err.message);
         }
       }
-      // Free server memory
+
+      // Evict room state from RAM once everyone leaves
       roomStates.delete(docId);
     }
   });
 });
 
-// Explicitly bind to "0.0.0.0" so Render proxy can route traffic
+// Bind to 0.0.0.0 for Render edge proxy routing
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`SyncScript server active on port ${PORT}`);
 });
