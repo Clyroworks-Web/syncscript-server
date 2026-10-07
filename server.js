@@ -9,7 +9,7 @@ require("dotenv").config();
 
 const app = express();
 
-// Security Headers: blocks clickjacking, sniffing, and hides X-Powered-By
+// Security Headers: blocks clickjacking, MIME sniffing, and removes X-Powered-By
 app.use(
   helmet({
     contentSecurityPolicy: false,
@@ -17,7 +17,7 @@ app.use(
   })
 );
 
-// Restricted CORS: only allows authorized local and production origins
+// Restricted CORS: only allows authorized production and local origins
 const allowedOrigins = [
   "https://syncscript-client-sigma.vercel.app",
   "http://localhost:5173",
@@ -39,7 +39,7 @@ app.use(
 const PORT = process.env.PORT || 5000;
 const server = http.createServer(app);
 
-// Socket.io configuration matching Express CORS policy
+// Socket.io configuration matching CORS policy
 const io = new Server(server, {
   cors: {
     origin: allowedOrigins,
@@ -92,7 +92,6 @@ const roomStates = new Map();
 // Trailing-edge database flush timers: docId -> timeoutId
 const saveTimeouts = new Map();
 
-// Socket handlers
 io.on("connection", (socket) => {
   socket.on("get-document", async (payload) => {
     const docId = typeof payload === "object" && payload !== null ? payload.docId : payload;
@@ -124,7 +123,7 @@ io.on("connection", (socket) => {
       socket.hostKey = isMatch ? incomingHostKey : null;
     }
 
-    // Immediately send current buffer to late arrivals or refreshed clients
+    // Immediately send current buffer to joining/reconnecting client
     socket.emit("load-document", room.data || "");
 
     socket.emit("room-init", {
@@ -168,7 +167,36 @@ io.on("connection", (socket) => {
     io.to(docId).emit("lock-updated", room.isLocked);
   });
 
-  // Trailing-Edge Save: Updates RAM immediately, persists to MongoDB after 1000ms idle
+  // Host Kill-Switch: Terminates session, evicts RAM, wipes doc from MongoDB
+  socket.on("end-meeting", async (payload) => {
+    const docId = typeof payload === "object" ? payload.docId : socket.currentRoom;
+    const hostKey = typeof payload === "object" ? payload.hostKey : socket.hostKey;
+
+    const room = roomStates.get(docId);
+    if (!room || room.hostKey !== hostKey) return;
+
+    // 1. Notify all connected clients in the room
+    io.to(docId).emit("meeting-terminated");
+
+    // 2. Disconnect everyone from the socket room
+    io.in(docId).socketsLeave(docId);
+
+    // 3. Clear timers and purge from memory
+    if (saveTimeouts.has(docId)) {
+      clearTimeout(saveTimeouts.get(docId));
+      saveTimeouts.delete(docId);
+    }
+    roomStates.delete(docId);
+
+    // 4. Wipe document from MongoDB so old link is unusable
+    try {
+      await Document.findByIdAndDelete(docId);
+    } catch (err) {
+      console.error("Error wiping ended meeting document:", err.message);
+    }
+  });
+
+  // Debounced database write: flushes after 1000ms idle
   socket.on("save-document", (data) => {
     if (!socket.currentRoom) return;
     const docId = socket.currentRoom;
@@ -176,17 +204,14 @@ io.on("connection", (socket) => {
 
     if (room?.isLocked && !socket.isHost) return;
 
-    // 1. Instant in-memory cache update
     if (room && typeof data === "string") {
       room.data = data;
     }
 
-    // 2. Reset debounce timer on ongoing activity
     if (saveTimeouts.has(docId)) {
       clearTimeout(saveTimeouts.get(docId));
     }
 
-    // 3. Flush to MongoDB and refresh the 30-day TTL timestamp
     const timeoutId = setTimeout(async () => {
       saveTimeouts.delete(docId);
       const activeRoom = roomStates.get(docId);
@@ -206,7 +231,7 @@ io.on("connection", (socket) => {
     saveTimeouts.set(docId, timeoutId);
   });
 
-  // Disconnection handling: last-occupant flush and RAM cleanup
+  // Disconnection handler: flushes final changes and clears empty rooms
   socket.on("disconnect", async () => {
     const docId = socket.currentRoom;
     if (!docId) return;
@@ -234,13 +259,11 @@ io.on("connection", (socket) => {
         }
       }
 
-      // Evict room state from RAM once everyone leaves
       roomStates.delete(docId);
     }
   });
 });
 
-// Bind to 0.0.0.0 for Render edge proxy routing
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`SyncScript server active on port ${PORT}`);
 });
