@@ -9,7 +9,7 @@ require("dotenv").config();
 
 const app = express();
 
-// Security Headers: blocks clickjacking, MIME sniffing, and removes X-Powered-By
+// Security Headers
 app.use(
   helmet({
     contentSecurityPolicy: false,
@@ -17,7 +17,7 @@ app.use(
   })
 );
 
-// Restricted CORS: only allows authorized production and local origins
+// Restricted CORS: only allow authorized frontend origins
 const allowedOrigins = [
   "https://syncscript-client-sigma.vercel.app",
   "http://localhost:5173",
@@ -39,7 +39,7 @@ app.use(
 const PORT = process.env.PORT || 5000;
 const server = http.createServer(app);
 
-// Socket.io configuration matching CORS policy
+// Socket.io configuration matching CORS rules
 const io = new Server(server, {
   cors: {
     origin: allowedOrigins,
@@ -92,6 +92,7 @@ const roomStates = new Map();
 // Trailing-edge database flush timers: docId -> timeoutId
 const saveTimeouts = new Map();
 
+// Socket Connection & Event Handlers
 io.on("connection", (socket) => {
   socket.on("get-document", async (payload) => {
     const docId = typeof payload === "object" && payload !== null ? payload.docId : payload;
@@ -105,6 +106,7 @@ io.on("connection", (socket) => {
     let room = roomStates.get(docId);
 
     if (!room) {
+      // First user to enter becomes the Host
       const assignedKey = incomingHostKey || crypto.randomUUID();
       const document = await findOrCreateDocument(docId);
       const initialData = document ? document.data : "";
@@ -118,14 +120,16 @@ io.on("connection", (socket) => {
       socket.isHost = true;
       socket.hostKey = assignedKey;
     } else {
+      // Returning user: verify if hostKey matches
       const isMatch = Boolean(incomingHostKey && room.hostKey === incomingHostKey);
       socket.isHost = isMatch;
       socket.hostKey = isMatch ? incomingHostKey : null;
     }
 
-    // Immediately send current buffer to joining/reconnecting client
+    // Immediately send document content to joining client
     socket.emit("load-document", room.data || "");
 
+    // Send host status and lock state to client
     socket.emit("room-init", {
       isHost: socket.isHost,
       isLocked: room.isLocked,
@@ -175,7 +179,7 @@ io.on("connection", (socket) => {
     const room = roomStates.get(docId);
     if (!room || room.hostKey !== hostKey) return;
 
-    // 1. Notify all connected clients in the room
+    // 1. Alert all connected clients in the room
     io.to(docId).emit("meeting-terminated");
 
     // 2. Disconnect everyone from the socket room
@@ -188,7 +192,7 @@ io.on("connection", (socket) => {
     }
     roomStates.delete(docId);
 
-    // 4. Wipe document from MongoDB so old link is unusable
+    // 4. Wipe document from MongoDB so the link cannot be reused
     try {
       await Document.findByIdAndDelete(docId);
     } catch (err) {
@@ -196,7 +200,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Debounced database write: flushes after 1000ms idle
+  // Debounced database write (1000ms idle threshold)
   socket.on("save-document", (data) => {
     if (!socket.currentRoom) return;
     const docId = socket.currentRoom;
@@ -231,7 +235,7 @@ io.on("connection", (socket) => {
     saveTimeouts.set(docId, timeoutId);
   });
 
-  // Disconnection handler: flushes final changes and clears empty rooms
+  // Disconnection handler: cleans cursor and persists last buffer
   socket.on("disconnect", async () => {
     const docId = socket.currentRoom;
     if (!docId) return;
@@ -264,6 +268,7 @@ io.on("connection", (socket) => {
   });
 });
 
+// Bind to 0.0.0.0 for cloud proxy compatibility
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`SyncScript server active on port ${PORT}`);
 });
