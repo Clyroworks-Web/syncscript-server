@@ -1,274 +1,201 @@
+require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const mongoose = require("mongoose");
 const cors = require("cors");
-const helmet = require("helmet");
-const crypto = require("crypto");
-require("dotenv").config();
 
 const app = express();
+const server = http.createServer(app);
 
-// Security Headers
-app.use(
-  helmet({
-    contentSecurityPolicy: false,
-    crossOriginEmbedderPolicy: false,
-  })
-);
-
-// Restricted CORS: only allow authorized frontend origins
+// Allow Vercel frontend and local development
 const allowedOrigins = [
   "https://syncscript-client-sigma.vercel.app",
   "http://localhost:5173",
   "http://localhost:3000",
-];
+  process.env.CLIENT_URL,
+].filter(Boolean);
 
 app.use(
   cors({
     origin: (origin, callback) => {
       if (!origin || allowedOrigins.includes(origin)) {
-        return callback(null, true);
+        callback(null, true);
+      } else {
+        callback(null, true); // Allow all during testing if needed
       }
-      return callback(new Error("CORS policy violation: Unauthorized origin"));
     },
     credentials: true,
   })
 );
 
-const PORT = process.env.PORT || 5000;
-const server = http.createServer(app);
+app.use(express.json());
 
-// Socket.io configuration matching CORS rules
+// 1. DATABASE CONNECTION
+// Reads MONGODB_URI or MONGO_URI from Render environment variables
+const MONGODB_URI =
+  process.env.MONGODB_URI ||
+  process.env.MONGO_URI ||
+  "mongodb://127.0.0.1:27017/syncscript";
+
+mongoose
+  .connect(MONGODB_URI)
+  .then(() => console.log(" Connected to MongoDB Atlas successfully!"))
+  .catch((err) => console.error(" MongoDB Connection Error:", err.message));
+
+// Document Schema
+const DocumentSchema = new mongoose.Schema(
+  {
+    _id: String,
+    data: { type: String, default: "" },
+  },
+  { timestamps: true }
+);
+
+const Document = mongoose.model("Document", DocumentSchema);
+
+// In-Memory Room Management for Live Sessions
+const roomStates = new Map();
+
+// Helper to get or create document from Atlas
+async function findOrCreateDocument(id) {
+  if (!id) return null;
+  const doc = await Document.findById(id);
+  if (doc) return doc;
+  return await Document.create({ _id: id, data: "" });
+}
+
+// 2. SOCKET.IO SETUP
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: "*",
     methods: ["GET", "POST"],
     credentials: true,
   },
 });
 
-// Root Health Check Route
-app.get("/", (req, res) => {
-  res.send("SyncScript server is healthy and running!");
-});
-
-// MongoDB Atlas Connection
-const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/syncscript";
-
-mongoose
-  .connect(MONGO_URI)
-  .then(() => console.log("Connected to MongoDB Atlas"))
-  .catch((err) => console.error("MongoDB Connection Error:", err.message));
-
-// Document Schema with 30-Day Auto-Expiration (TTL)
-const DocumentSchema = new mongoose.Schema({
-  _id: String,
-  data: { type: String, default: "" },
-  updatedAt: {
-    type: Date,
-    default: Date.now,
-    expires: 2592000, // 30 days in seconds (30 * 24 * 60 * 60)
-  },
-});
-
-const Document = mongoose.model("Document", DocumentSchema);
-
-async function findOrCreateDocument(id) {
-  if (!id) return null;
-  try {
-    const doc = await Document.findById(id);
-    if (doc) return doc;
-    return await Document.create({ _id: id, data: "" });
-  } catch (err) {
-    console.error("Document lookup error:", err.message);
-    return null;
-  }
-}
-
-// In-memory room manager: docId -> { isLocked: boolean, hostKey: string, data: string }
-const roomStates = new Map();
-
-// Trailing-edge database flush timers: docId -> timeoutId
-const saveTimeouts = new Map();
-
-// Socket Connection & Event Handlers
 io.on("connection", (socket) => {
-  socket.on("get-document", async (payload) => {
-    const docId = typeof payload === "object" && payload !== null ? payload.docId : payload;
-    const incomingHostKey = typeof payload === "object" && payload !== null ? payload.hostKey : null;
+  let currentDocId = null;
 
+  // Initialize room and load document
+  socket.on("get-document", async ({ docId, hostKey }) => {
     if (!docId) return;
+    currentDocId = docId;
 
     socket.join(docId);
-    socket.currentRoom = docId;
 
-    let room = roomStates.get(docId);
-
-    if (!room) {
-      // First user to enter becomes the Host
-      const assignedKey = incomingHostKey || crypto.randomUUID();
-      const document = await findOrCreateDocument(docId);
-      const initialData = document ? document.data : "";
-
-      room = {
+    // Initialize in-memory state for room if first time
+    if (!roomStates.has(docId)) {
+      roomStates.set(docId, {
+        hostKey: hostKey || null,
         isLocked: false,
-        hostKey: assignedKey,
-        data: initialData,
-      };
-      roomStates.set(docId, room);
-      socket.isHost = true;
-      socket.hostKey = assignedKey;
-    } else {
-      // Returning user: verify if hostKey matches
-      const isMatch = Boolean(incomingHostKey && room.hostKey === incomingHostKey);
-      socket.isHost = isMatch;
-      socket.hostKey = isMatch ? incomingHostKey : null;
+        isEnded: false,
+        users: new Set(),
+      });
     }
 
-    // Immediately send document content to joining client
-    socket.emit("load-document", room.data || "");
+    const room = roomStates.get(docId);
+    if (!room.hostKey && hostKey) {
+      room.hostKey = hostKey;
+    }
 
-    // Send host status and lock state to client
+    room.users.add(socket.id);
+
+    const isHost = Boolean(hostKey && room.hostKey === hostKey);
+
+    // Send initial status back to caller
     socket.emit("room-init", {
-      isHost: socket.isHost,
+      isHost,
       isLocked: room.isLocked,
-      assignedHostKey: socket.isHost ? room.hostKey : null,
+      isEnded: room.isEnded,
     });
 
-    const count = io.sockets.adapter.rooms.get(docId)?.size || 1;
-    io.to(docId).emit("user-count", count);
-  });
+    // Broadcast updated user count
+    io.to(docId).emit("user-count", room.users.size);
 
-  socket.on("send-changes", (delta) => {
-    if (!socket.currentRoom) return;
-    const room = roomStates.get(socket.currentRoom);
-    if (room?.isLocked && !socket.isHost) return;
-
-    if (room && typeof delta === "string") {
-      room.data = delta;
+    // Load document content from database
+    const document = await findOrCreateDocument(docId);
+    if (document) {
+      socket.emit("load-document", document.data);
     }
-
-    socket.broadcast.to(socket.currentRoom).emit("receive-changes", delta);
   });
 
-  socket.on("cursor-move", (data) => {
-    if (!socket.currentRoom) return;
-    socket.broadcast.to(socket.currentRoom).emit("cursor-update", {
-      socketId: socket.id,
-      ...data,
-    });
+  // Broadcast text changes
+  socket.on("send-changes", (content) => {
+    if (!currentDocId) return;
+    const room = roomStates.get(currentDocId);
+    if (room && room.isEnded) return;
+
+    socket.to(currentDocId).emit("receive-changes", content);
   });
 
-  socket.on("toggle-lock", (payload) => {
-    const docId = typeof payload === "object" ? payload.docId : socket.currentRoom;
-    const hostKey = typeof payload === "object" ? payload.hostKey : socket.hostKey;
+  // Save changes to MongoDB Atlas
+  socket.on("save-document", async (content) => {
+    if (!currentDocId) return;
+    const room = roomStates.get(currentDocId);
+    if (room && room.isEnded) return;
 
-    const room = roomStates.get(docId);
-    if (!room || room.hostKey !== hostKey) return;
-
-    room.isLocked = !room.isLocked;
-    io.to(docId).emit("lock-updated", room.isLocked);
-  });
-
-  // Host Kill-Switch: Terminates session, evicts RAM, wipes doc from MongoDB
-  socket.on("end-meeting", async (payload) => {
-    const docId = typeof payload === "object" ? payload.docId : socket.currentRoom;
-    const hostKey = typeof payload === "object" ? payload.hostKey : socket.hostKey;
-
-    const room = roomStates.get(docId);
-    if (!room || room.hostKey !== hostKey) return;
-
-    // 1. Alert all connected clients in the room
-    io.to(docId).emit("meeting-terminated");
-
-    // 2. Disconnect everyone from the socket room
-    io.in(docId).socketsLeave(docId);
-
-    // 3. Clear timers and purge from memory
-    if (saveTimeouts.has(docId)) {
-      clearTimeout(saveTimeouts.get(docId));
-      saveTimeouts.delete(docId);
-    }
-    roomStates.delete(docId);
-
-    // 4. Wipe document from MongoDB so the link cannot be reused
     try {
-      await Document.findByIdAndDelete(docId);
+      await Document.findByIdAndUpdate(currentDocId, { data: content });
     } catch (err) {
-      console.error("Error wiping ended meeting document:", err.message);
+      console.error("Error saving document:", err.message);
     }
   });
 
-  // Debounced database write (1000ms idle threshold)
-  socket.on("save-document", (data) => {
-    if (!socket.currentRoom) return;
-    const docId = socket.currentRoom;
+  // Live Multiplayer Cursors
+  socket.on("cursor-move", ({ x, y, name, color }) => {
+    if (!currentDocId) return;
+    socket.to(currentDocId).emit("cursor-update", {
+      socketId: socket.id,
+      x,
+      y,
+      name,
+      color,
+    });
+  });
+
+  // Host Lock Toggle
+  socket.on("toggle-lock", ({ docId, hostKey }) => {
     const room = roomStates.get(docId);
-
-    if (room?.isLocked && !socket.isHost) return;
-
-    if (room && typeof data === "string") {
-      room.data = data;
+    if (room && room.hostKey === hostKey && !room.isEnded) {
+      room.isLocked = !room.isLocked;
+      io.to(docId).emit("lock-updated", room.isLocked);
     }
-
-    if (saveTimeouts.has(docId)) {
-      clearTimeout(saveTimeouts.get(docId));
-    }
-
-    const timeoutId = setTimeout(async () => {
-      saveTimeouts.delete(docId);
-      const activeRoom = roomStates.get(docId);
-      if (!activeRoom) return;
-
-      try {
-        await Document.findByIdAndUpdate(
-          docId,
-          { data: activeRoom.data, updatedAt: new Date() },
-          { upsert: true }
-        );
-      } catch (err) {
-        console.error("Database flush error:", err.message);
-      }
-    }, 1000);
-
-    saveTimeouts.set(docId, timeoutId);
   });
 
-  // Disconnection handler: cleans cursor and persists last buffer
-  socket.on("disconnect", async () => {
-    const docId = socket.currentRoom;
-    if (!docId) return;
+  // Host Terminate Meeting
+  socket.on("end-meeting", ({ docId, hostKey }) => {
+    const room = roomStates.get(docId);
+    if (room && room.hostKey === hostKey) {
+      room.isEnded = true;
+      room.isLocked = true;
+      io.to(docId).emit("meeting-terminated");
+    }
+  });
 
-    io.to(docId).emit("cursor-remove", socket.id);
-    const roomOccupants = io.sockets.adapter.rooms.get(docId)?.size || 0;
-    io.to(docId).emit("user-count", roomOccupants);
+  // Handle User Disconnect
+  socket.on("disconnect", () => {
+    if (currentDocId && roomStates.has(currentDocId)) {
+      const room = roomStates.get(currentDocId);
+      room.users.delete(socket.id);
 
-    if (roomOccupants === 0) {
-      if (saveTimeouts.has(docId)) {
-        clearTimeout(saveTimeouts.get(docId));
-        saveTimeouts.delete(docId);
+      io.to(currentDocId).emit("cursor-remove", socket.id);
+      io.to(currentDocId).emit("user-count", room.users.size);
+
+      // Clean up empty room states
+      if (room.users.size === 0) {
+        roomStates.delete(currentDocId);
       }
-
-      const room = roomStates.get(docId);
-      if (room?.data) {
-        try {
-          await Document.findByIdAndUpdate(
-            docId,
-            { data: room.data, updatedAt: new Date() },
-            { upsert: true }
-          );
-        } catch (err) {
-          console.error("Final exit save error:", err.message);
-        }
-      }
-
-      roomStates.delete(docId);
     }
   });
 });
 
-// Bind to 0.0.0.0 for cloud proxy compatibility
-server.listen(PORT, "0.0.0.0", () => {
+// Basic Health Check Route
+app.get("/", (req, res) => {
+  res.send("SyncScript Backend Server is Running!");
+});
+
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, () => {
   console.log(`SyncScript server active on port ${PORT}`);
 });
