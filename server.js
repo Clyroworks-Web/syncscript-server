@@ -68,12 +68,10 @@ async function findOrCreateDocument(id) {
 // 2. SOCKET.IO SETUP
 const io = new Server(server, {
   cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-    credentials: true,
-  },
+    origin: "https://syncscript-client-sigma.vercel.app",
+    methods: ["GET", "POST"]
+  }
 });
-
 io.on("connection", (socket) => {
   let currentDocId = null;
 
